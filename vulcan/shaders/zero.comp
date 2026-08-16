@@ -1,0 +1,8 @@
+#version 450
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0, std430) buffer B0 { float b0[]; };
+layout(push_constant) uniform PC { uint size; uint pad1; uint pad2; uint pad3; uint pad4; uint pad5; uint pad6; uint pad7; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < pc.size) b0[i] = 0.0f;
+}

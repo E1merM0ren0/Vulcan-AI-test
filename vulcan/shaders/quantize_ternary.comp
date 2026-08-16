@@ -1,0 +1,25 @@
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0, std430) readonly buffer B0 { float W[]; };
+layout(binding = 1, std430) buffer B1 { float outQ[]; };
+layout(binding = 2, std430) buffer B2 { float sw[]; };
+layout(push_constant) uniform PC { uint n; uint cols; uint pad2; uint pad3; uint pad4; uint pad5; uint pad6; uint pad7; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n * pc.cols) return;
+    uint r = i / pc.cols;
+    uint c = i % pc.cols;
+    float acc = 0.0f;
+    for (uint j = 0u; j < pc.cols; j++) {
+        acc += abs(W[r * pc.cols + j]);
+    }
+    float s = acc / float(pc.cols);
+    sw[r] = s;
+    if (s == 0.0f) {
+        outQ[i] = 0.0f;
+        return;
+    }
+    float q = roundEven(W[i] / s);
+    q = clamp(q, -1.0f, 1.0f);
+    outQ[i] = q;
+}

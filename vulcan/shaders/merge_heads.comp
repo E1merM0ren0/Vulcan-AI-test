@@ -1,0 +1,13 @@
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0, std430) readonly buffer B0 { float inB[]; };
+layout(binding = 1, std430) buffer B1 { float outB[]; };
+layout(push_constant) uniform PC { uint n; uint heads; uint d; uint head; uint batch; uint pad5; uint pad6; uint pad7; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n * pc.d) return;
+    uint hd = pc.heads * pc.d;
+    uint t = i / pc.d;
+    uint j = i % pc.d;
+    outB[(pc.batch * pc.n + t) * hd + pc.head * pc.d + j] += inB[t * pc.d + j];
+}

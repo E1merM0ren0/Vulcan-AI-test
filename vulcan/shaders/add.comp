@@ -1,0 +1,10 @@
+#version 450
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0, std430) readonly buffer B0 { float b0[]; };
+layout(binding = 1, std430) readonly buffer B1 { float b1[]; };
+layout(binding = 2, std430) buffer B2 { float b2[]; };
+layout(push_constant) uniform PC { uint n; uint cols; uint pad2; uint pad3; uint pad4; uint pad5; uint pad6; uint pad7; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < pc.n * pc.cols) b2[i] = b0[i] + b1[i];
+}

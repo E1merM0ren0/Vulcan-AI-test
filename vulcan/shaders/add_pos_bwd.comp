@@ -1,0 +1,24 @@
+#version 450
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0, std430) readonly buffer B0 { float dO[]; };
+layout(binding = 1, std430) buffer B1 { float dX[]; };
+layout(binding = 2, std430) buffer B2 { float dP[]; };
+layout(push_constant) uniform PC { uint n; uint cols; uint seq; uint pad3; uint pad4; uint pad5; uint pad6; uint pad7; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n * pc.cols) return;
+    uint t = i / pc.cols;
+    if (t >= pc.seq) return;
+    uint c = i % pc.cols;
+    uint nb = pc.n / pc.seq;
+    float acc = 0.0f;
+    for (uint b = 0u; b < nb; b++) {
+        uint r = b * pc.seq + t;
+        acc += dO[r * pc.cols + c];
+    }
+    dP[t * pc.cols + c] = acc;
+    for (uint b = 0u; b < nb; b++) {
+        uint r = b * pc.seq + t;
+        dX[r * pc.cols + c] = dO[r * pc.cols + c];
+    }
+}

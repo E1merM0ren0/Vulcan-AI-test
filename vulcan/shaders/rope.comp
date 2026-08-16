@@ -1,0 +1,21 @@
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0, std430) readonly buffer B0 { float inB[]; };
+layout(binding = 1, std430) buffer B1 { float outB[]; };
+layout(push_constant) uniform PC { uint n; uint cols; uint pad2; uint pad3; uint pad4; uint pad5; uint pad6; uint pad7; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n * pc.cols) return;
+    uint r = i / pc.cols;
+    uint j = i % pc.cols;
+    float theta = float(r) * pow(10000.0f, -2.0f * float(j / 2u) / float(pc.cols));
+    float c = cos(theta);
+    float s = sin(theta);
+    float x0 = inB[i];
+    float x1 = (j + 1u < pc.cols) ? inB[r * pc.cols + j + 1u] : 0.0f;
+    if ((j & 1u) == 0u) {
+        outB[i] = x0 * c - x1 * s;
+    } else {
+        outB[i] = x0 * c + inB[r * pc.cols + j - 1u] * s;
+    }
+}

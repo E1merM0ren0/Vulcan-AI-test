@@ -1,0 +1,18 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(binding = 0, std430) readonly buffer B0 { float A[]; };
+layout(binding = 1, std430) readonly buffer B1 { float B[]; };
+layout(binding = 2, std430) buffer B2 { float C[]; };
+layout(push_constant) uniform PC { uint m; uint n; uint k; uint tA; uint tB; uint pad5; uint pad6; uint pad7; } pc;
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    uint c = gl_GlobalInvocationID.y;
+    if (r >= pc.m || c >= pc.n) return;
+    float acc = 0.0f;
+    for (uint kk = 0u; kk < pc.k; kk++) {
+        float av = pc.tA != 0u ? A[kk * pc.m + r] : A[r * pc.k + kk];
+        float bv = pc.tB != 0u ? B[c * pc.k + kk] : B[kk * pc.n + c];
+        acc += av * bv;
+    }
+    C[r * pc.n + c] = acc;
+}

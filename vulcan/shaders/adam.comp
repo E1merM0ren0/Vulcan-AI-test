@@ -1,0 +1,24 @@
+#version 450
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0, std430) buffer B0 { float p[]; };
+layout(binding = 1, std430) buffer B1 { float m[]; };
+layout(binding = 2, std430) buffer B2 { float v[]; };
+layout(binding = 3, std430) readonly buffer B3 { float g[]; };
+layout(push_constant) uniform PC { uint size; uint lrBits; uint t; uint pad3; uint pad4; uint pad5; uint pad6; uint pad7; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.size) return;
+    const float beta1 = 0.9f;
+    const float beta2 = 0.999f;
+    const float eps = 1e-8f;
+    float lr = uintBitsToFloat(pc.lrBits);
+    float mt = m[i] * beta1 + (1.0f - beta1) * g[i];
+    float vt = v[i] * beta2 + (1.0f - beta2) * g[i] * g[i];
+    m[i] = mt;
+    v[i] = vt;
+    float b1t = pow(beta1, float(pc.t));
+    float b2t = pow(beta2, float(pc.t));
+    float mhat = mt / (1.0f - b1t);
+    float vhat = vt / (1.0f - b2t);
+    p[i] -= lr * mhat / (sqrt(vhat) + eps);
+}

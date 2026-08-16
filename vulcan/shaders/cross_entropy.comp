@@ -1,0 +1,20 @@
+#version 450
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0, std430) readonly buffer B0 { float logits[]; };
+layout(binding = 1, std430) readonly buffer B1 { float y[]; };
+layout(binding = 2, std430) buffer B2 { float outL[]; };
+layout(push_constant) uniform PC { uint n; uint cols; uint pad2; uint pad3; uint pad4; uint pad5; uint pad6; uint pad7; } pc;
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= pc.n) return;
+    float m = -3.402823466e+38f;
+    for (uint j = 0u; j < pc.cols; j++) {
+        m = max(m, logits[r * pc.cols + j]);
+    }
+    float s = 0.0f;
+    for (uint j = 0u; j < pc.cols; j++) {
+        s += exp(logits[r * pc.cols + j] - m);
+    }
+    float loss = m + log(s) - logits[r * pc.cols + uint(int(y[r]))];
+    outL[r] = loss / float(pc.n);
+}
