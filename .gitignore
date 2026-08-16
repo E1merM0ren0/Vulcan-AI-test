@@ -1,0 +1,21 @@
+# vendored upstream llama.cpp (reference only, huge)
+vulcan/llama.cpp/
+
+# build artifacts (binaries, shaders, logs)
+vulcan/build/
+
+# generated data + checkpoints (regenerate via tools/stream_*.py)
+data/
+vulcan/data/*.bin
+vulcan/data/*.gguf
+
+# python / cython build artifacts
+__pycache__/
+*.pyc
+*.pyd
+vulcan/vulcanref/vulcanref.c
+
+# verification log artifacts at the repo root
+llama_out.txt
+probe_out.txt
+smoke_out.txt

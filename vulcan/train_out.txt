@@ -1,0 +1,103 @@
+gpt2 main: argc=4
+MNIST: train 2000 x 784, test 1000 x 784
+GPU: Intel(R) UHD Graphics
+PROBE gpuUpdate tokEmb 1.000e-03 posEmb 1.000e-03 outW 1.000e-03 wq0 1.000e-03
+PROBE sum(probs)=20003.7832  loss[0]=20003.8105  rowsum0=1.0000 rowsum1=1.0000 p[0..4]={0.001615,0.0003153,0.00138,0.002564,0.003718}
+  cpu fwd...
+  cpu fwd done, loss=6.378757
+  cpu back done
+PROBE grad tokEmb gpu -18.473484 cpu -18.473484
+PROBE grad posEmb gpu -0.442386 cpu -0.442386
+PROBE grad outW  gpu 0.752271 cpu 0.752271
+PROBE grad outNg gpu 0.015931 cpu 0.015931
+PROBE grad blk0 Wq gpu -0.004510 cpu -0.004510
+PROBE grad blk0 Wo gpu 0.065767 cpu 0.065767
+PROBE grad blk0 Wfc gpu -0.003388 cpu -0.003388
+PROBE grad blk0 Wproj gpu -0.001658 cpu -0.001658
+PROBE grad blk0 ln1g gpu -0.328813 cpu -0.328814
+PROBE grad blk0 ln2g gpu 0.009830 cpu 0.009830
+PROBE grad dHintoBlocks gpu0 -0.000000 cpu0 -0.000000 maxDiff 0.0000
+PROBE grad dN1 gpu0 -0.001963 cpu0 -0.001963 maxDiff 0.0000
+PROBE grad dH2 gpu0 0.000074 cpu0 -0.000018 maxDiff 0.0006
+PROBE grad dAttnA gpu0 0.000075 cpu0 0.000075 maxDiff 0.0000 |cpuAtt|max 0.000577
+PROBE grad dScores gpu0 0.000000 cpu0 0.000000 maxDiff 0.0000
+PROBE grad dQh gpu0 0.000000 cpu0 0.000000 maxDiff 0.0000
+PROBE grad dKh gpu0 0.000095 cpu0 0.000095 maxDiff 0.0000
+PROBE grad dVh gpu0 0.000309 maxDiff 0.0000
+PROBE blk0 dQ gpu0 0.000000 cpu0 0.000000 maxDiff 0.000000
+PROBE blk0 dK gpu0 0.000095 cpu0 0.000095 maxDiff 0.000000
+PROBE blk0 dV gpu0 0.000309 cpu0 0.000309 maxDiff 0.000000
+PROBE blk0 dQ perm? 0.00000000 dK perm? 0.00000000 dV perm? 0.00000000
+PROBE blk0 dQh cpuVsGpu 0.00000000 dKh cpuVsGpu 0.00000000 dVh cpuVsGpu 0.00000000
+PROBE blk0 dN2 gpu0 -0.000008 cpu0 -0.000008 maxDiff 0.00000000
+PROBE blk0 dGg gpu0 0.000017 cpu0 0.000017 maxDiff 0.00000000
+PROBE blk0 dMfc gpu0 0.000019 cpu0 0.000019 maxDiff 0.00000000
+PROBE grad dHin0 gpu0 -0.107352 cpu0 -0.107352 maxDiff 0.0000
+PROBE grad dH1out gpu0 0.000093 cpu0 0.000093 maxDiff 0.00000000
+PROBE blk0 dH2iso gpu0 -0.000018 cpu0 -0.000018 maxDiff 0.00000000
+PROBE grad blk1 dN1 gpu0 0.000162 cpu0 0.000162 maxDiff 0.0000
+PROBE blk1 dAo gpu0 -0.000004 cpu0 -0.000004 maxDiff 0.000000
+PROBE blk1 dH2iso gpu0 -0.000004 cpuH2 -0.000004 maxDiff 0.000000
+PROBE blk1 dAh gpu0 -0.000001 cpu0 -0.000001 maxDiff 0.000000
+PROBE blk1 dQ gpu0 0.000000 cpu0 0.000000 maxDiff 0.000000
+PROBE blk1 dK gpu0 -0.000064 cpu0 -0.000064 maxDiff 0.000000
+PROBE blk1 dV gpu0 0.000005 cpu0 0.000005 maxDiff 0.000000
+PROBE blk1 dK perm? maxDiff 0.00000000
+PROBE blk1 dV perm? maxDiff 0.00000000
+PROBE blk1 dK cpuVsHead 0.00000000
+PROBE blk1 dV cpuVsHead 0.00000000
+PROBE blk1 dQ perm? maxDiff 0.00000000
+PROBE blk1 dQh cpuVsGpu 0.00000000
+PROBE blk1 dKh cpuVsGpu 0.00000000
+PROBE blk1 dVh cpuVsGpu 0.00000000
+PROBE grad blk1 dAttnA gpu0 -0.000001 cpu0 -0.000001 maxDiff 0.0000
+PROBE grad blk1 dScores gpu0 0.000000 cpu0 0.000000 maxDiff 0.0000
+PROBE grad blk1 dQh gpu0 0.000000 cpu0 0.000000 maxDiff 0.0000
+PROBE grad blk1 dKh gpu0 -0.000064 cpu0 -0.000064 maxDiff 0.0000
+PROBE grad blk1 dVh gpu0 0.000005 cpu0 0.000005 maxDiff 0.0000
+PROBE grad blk1 dKh loc:    maxdiff at head10 t12 d10 gpu 0.000086 cpu 0.000086
+PROBE grad blk1 dVh loc:    maxdiff at head9 t39 d14 gpu 0.000249 cpu 0.000249
+PROBE grad blk1 dQh loc:    maxdiff at head11 t453 d3 gpu 0.000000 cpu 0.000000
+PROBE recVh gpuGrad 0.000005 recFromGpu 0.000005 cpu 0.000005 maxGradRec 0.0000 maxRecCpu 0.0000
+PROBE recQ  gpuGrad 0.000000 recFromGpu 0.000000 cpu 0.000000 maxGradRec 0.0000 maxRecCpu 0.0000
+PROBE grad blk1 dN2 gpu0 -0.000008 cpu0 -0.000008 maxDiff 0.0000
+PROBE grad blk1 dMfc gpu0 0.000013 cpu0 0.000013 maxDiff 0.0000
+PROBE grad blk1 dGg gpu0 0.000012 cpu0 0.000012 maxDiff 0.0000
+PROBE grad blk1 Wq gpu -0.000018 cpu -0.000018
+PROBE grad blk1 Wo gpu -0.034970 cpu -0.034970
+PROBE grad blk1 Wfc gpu -0.015568 cpu -0.015568
+PROBE grad blk1 Wproj gpu -0.004528 cpu -0.004528
+PROBE grad blk1 ln1g gpu 0.004231 cpu 0.004231
+PROBE grad blk1 ln2g gpu 0.014235 cpu 0.014235
+PROBE L0 n1 maxDiff 0.0000
+PROBE L0 attnA maxDiff 0.0000
+PROBE L0 ln2In maxDiff 0.0000
+PROBE L0 gg maxDiff 0.0000
+PROBE L0 attnP maxDiff 0.0000
+PROBE L0 softmaxP(self) maxDiff 0.0000
+PROBE L0 attnPre maxDiff 0.0000
+PROBE smpl bh0 r0 Psum 1.0000 rawSum 17.03 | P[u0..3] 1.0000 0.0000 0.0000 0.0000 raw 2.842 -1.320 4.401 7.851
+PROBE smpl bh0 r1 Psum 1.0000 rawSum 673.83 | P[u0..3] 0.7396 0.2604 0.0000 0.0000 raw 2.356 -1.819 6.487 7.755
+PROBE smpl bh1 r0 Psum 1.0000 rawSum -187.49 | P[u0..3] 1.0000 0.0000 0.0000 0.0000 raw -3.173 -1.607 -0.641 -1.123
+PROBE smpl bh1 r1 Psum 1.0000 rawSum 597.35 | P[u0..3] 0.5059 0.4941 0.0000 0.0000 raw -3.671 -3.765 1.465 4.816
+PROBE L0 qh(permuted) maxDiff 0.0000
+PROBE h[0] maxDiff 0.0000
+PROBE h[1] maxDiff 0.0000
+PROBE h0 maxDiff 0.0000
+PROBE rawLogits gpu[min -3.585 max 4.044 mean -0.072] cpu[min -3.585 max 4.044 mean -0.072] maxDiff 0.0000
+PROBE blk0 Wq=5.960e-08
+PROBE blk1 Wq=9.835e-07
+--- oracle check (1 step, batch 4) ---
+loss  GPU=6.378766  CPU=6.378757  diff=8.583e-06
+tokEmb=5.611e-08  posEmb=7.404e-08  outNorm=1.192e-07  outW=8.583e-06  blkMax=2.706e-04
+ORACLE: PASS
+--- training (5 epochs x 4 batches, lr=0.0010) ---
+epoch  0  loss=3.176569
+epoch  1  loss=1.821262
+epoch  2  loss=1.569438
+epoch  3  loss=1.521113
+epoch  4  loss=1.459620
+epoch  5  loss=1.387341
+--- test accuracy ---
+  81/1000 = 8.1%
+wrote C:/Users/elmer/Desktop/ai Projects/vulcan/data/mnist-gpt2-f32.gguf (37 tensors, 0.74 MB, GGUF v3)
