@@ -30,6 +30,7 @@
 #include <fstream>
 #include <iostream>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -1086,12 +1087,52 @@ struct GPUModel {
     }
 };
 
+static bool parsePosInt(const char* s, int& out) {
+    try {
+        size_t pos = 0;
+        int v = std::stoi(s, &pos);
+        // reject trailing junk (e.g. "12abc") and empty / non-numeric input
+        if (s[pos] != '\0' || v < 0) return false;
+        out = v;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static void usage(const char* prog) {
+    std::cerr
+        << "usage: " << prog << " [<trainUse> <epochs> <seed> <base>] [--help]\n"
+        << "  trainUse  max train rows to use (default 6000)\n"
+        << "  epochs    number of epochs (default 5)\n"
+        << "  seed      RNG seed (default 42)\n"
+        << "  base      dataset base name; reads vulcan/data/<base>_train.bin / _test.bin\n"
+        << "            defaults to \"mnist\"\n"
+        << "  --help    show this message and exit\n";
+}
+
 int main(int argc, char** argv) {
     int trainUse = 6000, epochs = 5, seed = 42;
     std::string base = "mnist";
-    if (argc > 1) trainUse = std::atoi(argv[1]);
-    if (argc > 2) epochs = std::atoi(argv[2]);
-    if (argc > 3) seed = std::atoi(argv[3]);
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--help" || a == "-h") {
+            usage(argv[0]);
+            return 0;
+        }
+    }
+    if (argc > 1 && !parsePosInt(argv[1], trainUse)) {
+        usage(argv[0]);
+        return 2;
+    }
+    if (argc > 2 && !parsePosInt(argv[2], epochs)) {
+        usage(argv[0]);
+        return 2;
+    }
+    if (argc > 3 && !parsePosInt(argv[3], seed)) {
+        usage(argv[0]);
+        return 2;
+    }
     if (argc > 4) base = argv[4];
 
     std::string trainPath = "vulcan/data/" + base + "_train.bin";

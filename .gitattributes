@@ -1,0 +1,18 @@
+# Normalize line endings on commit so checkouts are consistent across Windows/Unix.
+* text=auto
+
+*.c   text eol=lf
+*.cpp text eol=lf
+*.h   text eol=lf
+*.hpp text eol=lf
+*.comp text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+*.py  text eol=lf
+*.md  text eol=lf
+
+# Never treat these as text
+*.bin binary
+*.gguf binary
+*.spv binary
+*.exe binary
