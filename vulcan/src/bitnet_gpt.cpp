@@ -40,6 +40,19 @@
 // and the --fp CLI flag.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Model hyperparameters (all static; see the header alias in AGENTS.md).
+//   E     - hidden width
+//   HEADS - # attention heads, each of head-dim D
+//   FF    - MLP hidden width
+//   BLOCKS- # transformer blocks
+//   BATCH - rows (sequences) processed per training step
+//   SEQ   - sequence length per row = BYTES bytes + 1 SEP token
+//   BYTES - raw bytes per dataset row (padded .bin feature count)
+//   LN_EPS- RMSNorm epsilon
+//   LR    - AdamW-style learning rate used by the adam shader
+//   LOSS_TOL / GRAD_TOL - oracle acceptance thresholds
+// ---------------------------------------------------------------------------
 static const int E = 64;
 static const int HEADS = 4;
 static const int D = 16;
@@ -53,12 +66,18 @@ static const float LR = 1e-3f;
 static const float LOSS_TOL = 5e-3f;
 static const float GRAD_TOL = 1e-3f;
 
+// Bit-reinterpret a float as a signed int32 (used to smuggle LN_EPS etc. into
+// the int32 push-constant array for the dispatch).
 static int f32bits_i(float f) {
     uint32_t u;
     std::memcpy(&u, &f, 4);
     return (int)u;
 }
 
+// Locate the directory containing compiled .spv shaders by probing candidate
+// relative paths for matmul.spv. Normally vulcan/build/spv (repo root cwd).
+// NOTE: temporary/fresh build dirs (e.g. opencode/vbuild) are NOT searched here,
+// so a freshly added shader must also be copied into vulcan/build/spv to run.
 static std::string findSPVDir() {
     std::vector<std::string> cands = {
         "vulcan/build/spv", "build/spv", "spv",
@@ -71,7 +90,10 @@ static std::string findSPVDir() {
     return "vulcan/build/spv";
 }
 
+// Round a float to the nearest integer with ties-to-even (bitnet weight and
+// activation quantization use this; not the --fp knob).
 static float roundEven(float x) { return std::nearbyint(x); }
+// tanh-based GELU used for the MLP activation (matches the gelu.comp shader).
 static float geluF(float x) {
     float c = std::sqrt(2.0f / 3.14159265358979323846f);
     return 0.5f * x * (1.0f + std::tanh(c * (x + 0.044715f * x * x * x)));
@@ -164,7 +186,10 @@ struct CPUModel {
         for (size_t i = 0; i < n_; i++) v[i] = quantizeTo(prec, v[i]);
     }
 
-    static void qAbsmax(int n_, int k, const float* X, float* Xq, float* sx) {        for (int r = 0; r < n_; r++) {
+    // BitNet A8 absmax activation quantization: per-row scale = max|x|/127,
+    // values rounded to nearest int in [-127,127]. Xq[n*k], sx[n].
+    static void qAbsmax(int n_, int k, const float* X, float* Xq, float* sx) {
+        for (int r = 0; r < n_; r++) {
             float mx = 0.0f;
             for (int j = 0; j < k; j++) mx = std::max(mx, std::fabs(X[r * k + j]));
             float s = mx == 0.0f ? 0.0f : mx / 127.0f;
@@ -176,6 +201,8 @@ struct CPUModel {
             }
         }
     }
+    // BitNet W1.58 ternary weight quantization: per-row scale = mean|x|,
+    // values rounded to {-1,0,+1}. Wq[o*k], sw[o].
     static void qTernary(int n_, int k, const float* W, float* Wq, float* sw) {
         for (int r = 0; r < n_; r++) {
             float acc = 0.0f;
@@ -189,6 +216,10 @@ struct CPUModel {
             }
         }
     }
+    // Bitnet linear-layer forward, Y[n,o] = (Xq @ Wq^T) .* sx[n] .* sw[o],
+    // where Xq/Wq are the absmax/ternary quantized activations and weights.
+    // Mirrors the GPU "bitlinear" op sequence (quantize_absmax → quantize_ternary
+    // → matmul → scale_rows).
     static void blFwd(int n_, int k, int o, const float* X, const float* W, float* Y,
                       std::vector<float>& Xq, std::vector<float>& Wq,
                       std::vector<float>& sx, std::vector<float>& sw) {
@@ -205,6 +236,10 @@ struct CPUModel {
                 Y[r * o + oo] = (acc * sx[r]) * sw[oo];
             }
     }
+    // Backward through a bitnet linear layer.
+    //   dX = sx .* (dY .* sw) @ Wq
+    //   dW = sw .* (dY .* sx)^T @ Xq
+    // Uses the same saved Xq/Wq/sx/sw from the forward pass.
     static void blBwd(int n_, int k, int o, const float* dY, float* dX, float* dW,
                       const std::vector<float>& Xq, const std::vector<float>& Wq,
                       const std::vector<float>& sx, const std::vector<float>& sw) {
@@ -221,6 +256,7 @@ struct CPUModel {
                 dW[oo * k + i] = sw[oo] * acc;
             }
     }
+    // RMSNorm forward, O[r,j] = X[r,j] / sqrt(mean(X²)+eps) * W[j].
     static void rmsFwd(int n_, int cols, const float* X, const float* W, float* O) {
         for (int r = 0; r < n_; r++) {
             float sum = 0.0f;
@@ -229,6 +265,8 @@ struct CPUModel {
             for (int j = 0; j < cols; j++) O[r * cols + j] = X[r * cols + j] / denom * W[j];
         }
     }
+    // RMSNorm backward. Computes both dX (input grad) and dW (per-channel scale
+    // grad) given the forward input X, weight W, and upstream grad dO.
     static void rmsBwd(int n_, int cols, const float* X, const float* W,
                        const float* dO, float* dX, float* dW) {
         std::vector<float> dw((size_t)cols, 0.0f);
@@ -247,6 +285,12 @@ struct CPUModel {
         for (int j = 0; j < cols; j++) dW[j] = dw[j];
     }
 
+    // Exact CPU reference of the full forward pass (embedding sum → BLOCKS of
+    // [RMSNorm → q/k/v → causal self-attn → bitlinear output → residual,
+    //  RMSNorm → bitlinear up → GELU → bitlinear down → residual] → final RMSNorm
+    // → bitlinear lm head). Every intermediate is rounded to `prec` via q() at
+    // exactly the same boundaries the GPU graph injects precQ(), so the two
+    // agree bit-for-bit.
     void forward() {
         for (int r = 0; r < n; r++) {
             int id = (int)ids[r];
@@ -398,6 +442,9 @@ struct CPUModel {
         }
     }
 
+    // Exact CPU reference of the full backward pass: softmax-CE gradient through
+    // the lm head, RMSNorm, per-block bitlinear layers + causal attention, back
+    // to per-parameter gradients (gTokEmb/gPosEmb/gFinalNormW/gLmHeadW + gb[]).
     void backward() {
         initGrads();
         std::vector<float> dLogits((size_t)n * V, 0.0f);
@@ -1064,6 +1111,9 @@ struct GPUModel {
         return md;
     }
 
+    // Apply one Adam update to every parameter using its saved m/v moment
+    // buffers. Runs the "adam" shader once per parameter (params[i], m[i], v[i],
+    // grads[i]) with lr + timestep passed as push constants.
     void applyAdam(int stepNum) {
         uint32_t pc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         pc[1] = (uint32_t)f32bits_i(LR);
@@ -1077,6 +1127,9 @@ struct GPUModel {
         }
     }
 
+    // Fill the ids[]/targets[] tensors for one batch from the shuffled row index
+    // list. Per row: bytes at positions 0..BYTES-1, SEP token at BYTES, targets
+    // shifted +1 (next byte) with the class id appended at the end.
     void loadBatch(const std::vector<float>& tX, const std::vector<float>& tY, int feat,
                    const std::vector<int>& idx, int baseRow) {
         for (int r = 0; r < BATCH; r++) {
@@ -1090,6 +1143,10 @@ struct GPUModel {
         targets->dirtyUpload = true;
     }
 
+    // One training step: run the GPU graph forward + backward, then REPLAY the
+    // same batch through the CPU oracle and compare loss + per-parameter grads.
+    // Only if the oracle gate passes (loss_diff < LOSS_TOL, grad_diff < GRAD_TOL)
+    // do we apply Adam to the GPU weights; otherwise returns false (caller aborts).
     bool trainStep(CPUModel& cpu, const std::vector<float>& tX, const std::vector<float>& tY,
                    int feat, const std::vector<int>& idx, int baseRow, int stepNum) {
         loadBatch(tX, tY, feat, idx, baseRow);
@@ -1117,6 +1174,9 @@ struct GPUModel {
         return ok;
     }
 
+    // Inference-time classification accuracy on the test set. Batches the rows,
+    // runs only the forward graph, and picks the class logit (offset 256..)
+    // at the SEP position; returns correct/total.
     float eval(const std::vector<float>& eX, const std::vector<float>& eY, int feat, int eN) {
         int correct = 0;
         int nb = eN / BATCH;
@@ -1140,16 +1200,59 @@ struct GPUModel {
         return (float)correct / (float)(nb * BATCH);
     }
 
+    // Serialize the trained weights to a llama.cpp-compatible GGUF file using
+    // the "gpt2" architecture. Weights are written row-major but with GGUF
+    // dims {in, out} fastest-first (no data transpose). See gguf.h.
+    // llama.cpp's gpt2 arch requires biases and a fused QKV, both of which a
+    // BitNet-style model drops; we emit zero biases and concatenate the
+    // separate Q/K/V weights so the file loads under llama-server at all.
     bool exportGGUF(const std::string& path) {
         gguf::GGUFMeta meta;
-        meta.strings.push_back({"general.name", "vulcan-bitnet-gpt2"});
-        meta.u32s.push_back({"bitnet.block_count", (uint32_t)BLOCKS});
-        meta.u32s.push_back({"bitnet.context_length", (uint32_t)SEQ});
-        meta.u32s.push_back({"bitnet.embedding_length", (uint32_t)E});
-        meta.u32s.push_back({"bitnet.feed_forward_length", (uint32_t)FF});
-        meta.u32s.push_back({"bitnet.attention.head_count", (uint32_t)HEADS});
-        meta.u32s.push_back({"bitnet.attention.head_count_kv", (uint32_t)HEADS});
-        meta.f32s.push_back({"bitnet.attention.layer_norm_epsilon", LN_EPS});
+        meta.strings.push_back({"general.name", "vulcan-gpt2"});
+        meta.u32s.push_back({"general.alignment", 32});
+        meta.u32s.push_back({"general.file_type", 0});
+        meta.strings.push_back({"general.description", "trained via Vulkan compute, byte-level GPT-2"});
+
+        meta.u32s.push_back({"gpt2.block_count", (uint32_t)BLOCKS});
+        meta.u32s.push_back({"gpt2.context_length", (uint32_t)SEQ});
+        meta.u32s.push_back({"gpt2.embedding_length", (uint32_t)E});
+        meta.u32s.push_back({"gpt2.feed_forward_length", (uint32_t)FF});
+        meta.u32s.push_back({"gpt2.attention.head_count", (uint32_t)HEADS});
+        meta.u32s.push_back({"gpt2.attention.head_count_kv", (uint32_t)HEADS});
+        meta.f32s.push_back({"gpt2.attention.layer_norm_epsilon", LN_EPS});
+
+        // Byte-level GPT-2 tokenizer. tokens[0..255] are the GPT-2 byte->unicode
+        // BPE tokens; tokens[256..] are the NCLS class tokens (cls0..). merges
+        // stay empty (pure byte vocabulary, no BPE merges needed to load).
+        std::vector<std::string> toks;
+        std::vector<int> bs;
+        for (int b = 33; b <= 126; b++)  bs.push_back(b);
+        for (int b = 161; b <= 172; b++) bs.push_back(b);
+        for (int b = 174; b <= 255; b++) bs.push_back(b);
+        std::vector<int> cs = bs;
+        int n = 0;
+        for (int b = 0; b < 256; b++) {
+            bool in = false;
+            for (int x : bs) if (x == b) { in = true; break; }
+            if (!in) { bs.push_back(b); cs.push_back(256 + n); n++; }
+        }
+        for (int b = 0; b < 256; b++) {
+            int cc = 0;
+            for (int i = 0; i < (int)bs.size(); i++) if (bs[i] == b) { cc = cs[i]; break; }
+            // utf-8 encode the unicode code point so that byte -> char matches GPT-2 BPE
+            if (cc < 0x80)                    toks.push_back(std::string(1, (char)cc));
+            else if (cc < 0x800)              { char u[3] = { (char)(0xC0 | (cc >> 6)),   (char)(0x80 | (cc & 0x3F)), 0 }; toks.push_back(u); }
+            else                              { char u[4] = { (char)(0xE0 | (cc >> 12)),  (char)(0x80 | ((cc >> 6) & 0x3F)), (char)(0x80 | (cc & 0x3F)), 0 }; toks.push_back(u); }
+        }
+        for (int c = 0; c < V - 256; c++) toks.push_back("cls" + std::to_string(c));
+
+        meta.strings.push_back({"tokenizer.ggml.model", "gpt2"});
+        meta.strings.push_back({"tokenizer.ggml.pre", "gpt-2"});
+        meta.strArrays.push_back({"tokenizer.ggml.tokens", toks});
+        meta.strArrays.push_back({"tokenizer.ggml.merges", {}});
+        meta.i32Arrays.push_back({"tokenizer.ggml.token_type", std::vector<int32_t>((int)toks.size(), 1)});
+        meta.u32s.push_back({"tokenizer.ggml.bos_token_id", 0});
+        meta.u32s.push_back({"tokenizer.ggml.eos_token_id", (uint32_t)(V - 1)});
 
         std::vector<gguf::TensorInfo> tensors;
         auto addT = [&](const std::string& name, Tensor* t, std::vector<uint32_t> dims) {
@@ -1159,22 +1262,48 @@ struct GPUModel {
             ti.data = t->data;
             tensors.push_back(ti);
         };
+        auto addZ = [&](const std::string& name, std::vector<uint32_t> dims) {
+            gguf::TensorInfo ti;
+            ti.name = name;
+            ti.dims = dims;
+            size_t sz = 1;
+            for (uint32_t d : dims) sz *= d;
+            ti.data.assign(sz, 0.0f);
+            tensors.push_back(ti);
+        };
+
         addT("token_embd.weight", tokEmbW, {(uint32_t)E, (uint32_t)V});
+        addT("position_embd.weight", posEmbW, {(uint32_t)E, (uint32_t)SEQ});
         addT("output_norm.weight", finalNormW, {(uint32_t)E});
+        addZ("output_norm.bias", {(uint32_t)E});
         addT("output.weight", lmHeadW, {(uint32_t)E, (uint32_t)V});
+
         for (int l = 0; l < BLOCKS; l++) {
             std::string p = "blk." + std::to_string(l) + ".";
-            addT(p + "attn_norm.weight", blk[l].attnNormW, {(uint32_t)E});
-            addT(p + "attn_q.weight", blk[l].qW, {(uint32_t)E, (uint32_t)E});
-            addT(p + "attn_k.weight", blk[l].kW, {(uint32_t)E, (uint32_t)E});
-            addT(p + "attn_v.weight", blk[l].vW, {(uint32_t)E, (uint32_t)E});
+            // fused QKV = concat(q, k, v) along the out column, each {E, E} -> {E, 3E}
+            gguf::TensorInfo qkv;
+            qkv.name = p + "attn_qkv.weight";
+            qkv.dims = {(uint32_t)E, (uint32_t)(3 * E)};
+            qkv.data.reserve((size_t)3 * E * E);
+            for (Tensor* t : {blk[l].qW, blk[l].kW, blk[l].vW})
+                qkv.data.insert(qkv.data.end(), t->data.begin(), t->data.end());
+            tensors.push_back(qkv);
+
+            addZ(p + "attn_qkv.bias", {(uint32_t)(3 * E)});
             addT(p + "attn_output.weight", blk[l].oW, {(uint32_t)E, (uint32_t)E});
+            addZ(p + "attn_output.bias", {(uint32_t)E});
+            addT(p + "attn_norm.weight", blk[l].attnNormW, {(uint32_t)E});
+            addZ(p + "attn_norm.bias", {(uint32_t)E});
             addT(p + "ffn_norm.weight", blk[l].ffnNormW, {(uint32_t)E});
+            addZ(p + "ffn_norm.bias", {(uint32_t)E});
             addT(p + "ffn_up.weight", blk[l].fUpW, {(uint32_t)E, (uint32_t)FF});
+            addZ(p + "ffn_up.bias", {(uint32_t)FF});
             addT(p + "ffn_down.weight", blk[l].fDnW, {(uint32_t)FF, (uint32_t)E});
+            addZ(p + "ffn_down.bias", {(uint32_t)E});
         }
+
         std::string err;
-        if (!gguf::writeGGUF(path, "bitnet", meta, tensors, &err)) {
+        if (!gguf::writeGGUF(path, "gpt2", meta, tensors, &err)) {
             std::cerr << err << "\n";
             return false;
         }
@@ -1216,6 +1345,10 @@ static bool parsePrecision(const char* s, Precision& out) {
     return false;
 }
 
+// Entry point: parse CLI args (validate), load the .bin train/test datasets,
+// co-initialize the CPU oracle and the GPU graph with identical random weights,
+// then run the oracle-gated training loop and export the final GGUF.
+// Exit codes: 0 = success, 1 = data/vulkan/oracle error, 2 = CLI usage error.
 int main(int argc, char** argv) {
     int trainUse = 6000, epochs = 5, seed = 42;
     std::string base = "mnist";
@@ -1319,7 +1452,7 @@ int main(int argc, char** argv) {
 
     float acc = m.eval(eX, eY, eF, eN);
     std::cout << "test_accuracy=" << acc * 100.0f << "%\n";
-    m.exportGGUF("vulcan/data/" + base + "-bitnet-gpt2-" + precisionName(prec) + ".gguf");
+    m.exportGGUF("vulcan/data/" + base + "-gpt2-" + precisionName(prec) + ".gguf");
     m.ctx.shutdown();
     return 0;
 }

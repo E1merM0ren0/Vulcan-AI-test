@@ -1,11 +1,23 @@
+// precision.h — Selectable compute precision for the training graphs (--fp flag).
+//
+// W1.58 weight quantization / A8 absmax activation quantization are bitnet's
+// own schemes and stay FIXED. This header adds an orthogonal knob: the storage
+// precision of the intermediate FP32 tensors in the compute graph. It provides
+// CPU-side mini-float encode/decode (FP8 E4M3, FP4 E2M1) used by:
+//   - the CPU oracle (quantizeTo / CPUModel::q) to mirror the GPU at the same
+//     graph boundaries, and
+//   - as the bit-exact reference the GLSL shader (shaders/quantize_fp.comp) is
+//     written to match, so loss_diff == grad_diff == 0 under fp8/fp4.
+//
+// The encode functions are deliberately spelled out bit-by-bit (no third-party
+// float-conversion intrinsics) so the rounding is identical on CPU and GPU.
+
 #pragma once
 #include <cmath>
 #include <cstdint>
 
-// Selectable compute precision for the training graphs (--fp flag).
-// Bitnet weight quantization (W1.58 ternary) and A8 absmax activation
-// quantization are unchanged; this governs the storage/compute precision of
-// the intermediate FP32 tensors in the graph and mirrors it in the CPU oracle.
+// Which precision the whole compute graph runs at. FP32 is the default and
+// leaves the graph untouched (identity quantization).
 enum class Precision {
     FP32 = 0,
     FP8 = 1,
@@ -111,7 +123,9 @@ inline float fp4E2M1Decode(uint8_t b) {
     return sign ? -val : val;
 }
 
-// Quantize a float to target precision (round-trip value). FP32 is identity.
+// Quantize a float to target precision (round-trip VALUE in FP32 storage).
+// FP32 is identity. This is Buck's sole quantization entry point that both the
+// CPU oracle and (conceptually) the quantize_fp.comp shader must match.
 inline float quantizeTo(Precision p, float f) {
     switch (p) {
         case Precision::FP8: return fp8E4M3Decode(fp8E4M3Encode(f));

@@ -1,3 +1,13 @@
+// gguf.cpp — GGUF v3 binary writer.
+//
+// Layout (all little-endian):
+//   magic "GGUF" | version(3) | tensor_count | metadata_kv_count
+//   general.architecture string kv
+//   ... user meta kvs (string=8, uint32=6, float32=7), each prefixed with size
+//   tensor_info[n]: name | ndim | dims[] | type | data_offset
+//   padding to 32 bytes, then tensor data made 32-byte aligned
+// Each tensor's data is preceded by padding so its offset is a multiple of 32.
+
 #include "gguf.h"
 #include <cstring>
 #include <fstream>
@@ -35,7 +45,8 @@ bool writeGGUF(const std::string& path,
     }
 
     uint64_t kvCount = 1; // general.architecture
-    kvCount += meta.strings.size() + meta.u32s.size() + meta.f32s.size();
+    kvCount += meta.strings.size() + meta.u32s.size() + meta.f32s.size()
+             + meta.strArrays.size() + meta.i32Arrays.size();
 
     writeU32(f, 0x46554747);
     writeU32(f, 3);
@@ -53,13 +64,27 @@ bool writeGGUF(const std::string& path,
     }
     for (const auto& kv : meta.u32s) {
         writeString(f, kv.first);
-        writeU32(f, 6); // GGML_KV_META_TYPE_UINT32
+        writeU32(f, 4); // GGUF_TYPE_UINT32
         writeU32(f, kv.second);
     }
     for (const auto& kv : meta.f32s) {
         writeString(f, kv.first);
-        writeU32(f, 7); // GGML_KV_META_TYPE_FLOAT32
+        writeU32(f, 6); // GGUF_TYPE_FLOAT32
         writeF32(f, kv.second);
+    }
+    for (const auto& kv : meta.strArrays) {
+        writeString(f, kv.first);
+        writeU32(f, 9); // GGUF_TYPE_ARRAY
+        writeU32(f, 8); // element type: GGUF_TYPE_STRING
+        writeU64(f, (uint64_t)kv.second.size());
+        for (const auto& v : kv.second) writeString(f, v);
+    }
+    for (const auto& kv : meta.i32Arrays) {
+        writeString(f, kv.first);
+        writeU32(f, 9); // GGUF_TYPE_ARRAY
+        writeU32(f, 5); // element type: GGUF_TYPE_INT32
+        writeU64(f, (uint64_t)kv.second.size());
+        for (int32_t v : kv.second) writeU32(f, (uint32_t)v);
     }
 
     std::vector<uint64_t> offsets(tensors.size());
@@ -77,15 +102,20 @@ bool writeGGUF(const std::string& path,
         dataOffset += alignUp(byteSize, 32);
     }
 
-    uint64_t pad = 0;
     std::vector<char> padding(32, 0);
+
+    // The data section must begin on a 32-byte boundary, so pad out whatever
+    // the header (magic + counts + KV + tensor-info) ended on.
+    uint64_t headerPos = (uint64_t)f.tellp();
+    uint64_t padStart = alignUp(headerPos, 32) - headerPos;
+    if (padStart > 0) {
+        f.write(padding.data(), (std::streamsize)padStart);
+    }
+
     for (size_t i = 0; i < tensors.size(); i++) {
         const TensorInfo& t = tensors[i];
         uint64_t byteSize = 4;
         for (uint32_t d : t.dims) byteSize *= (uint64_t)d;
-        if (offsets[i] % 32 != 0) {
-            f.write(padding.data(), (std::streamsize)(32 - (long)(offsets[i] % 32)));
-        }
         f.write((const char*)t.data.data(), (std::streamsize)byteSize);
         uint64_t rem = alignUp(byteSize, 32) - byteSize;
         if (rem > 0) f.write(padding.data(), (std::streamsize)rem);

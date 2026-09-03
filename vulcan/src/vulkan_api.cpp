@@ -1,3 +1,15 @@
+// vulkan_api.cpp — Implementation of the minimal Vulkan compute wrapper.
+//
+// Rough lifecycle:
+//   init()    -> instance, device + compute queue, command pool, descriptor pool
+//   createBuffer() -> persistent host-visible mapping tracked in g_alloc
+//   runCompute()   -> lazily compiles the pipeline, binds buffers/push-constants,
+//                     records one dispatch, submits and waits idle
+//   shutdown() -> frees everything in reverse order.
+//
+// All buffers are host-coherent, so upload/download are plain memcpy on the
+// persistent mapping and results are visible immediately after vkQueueWaitIdle.
+
 #include "vulkan_api.h"
 #include <cstring>
 #include <fstream>
@@ -5,6 +17,9 @@
 
 namespace vk {
 
+// Pair a VkBuffer with its device memory + persistent CPU mapping.
+// The global g_alloc vector owns every live allocation so shutdown() and
+// destroyBuffer() can find and free them without the caller holding handles.
 struct BufferAlloc {
     VkBuffer buffer;
     VkDeviceMemory memory;
@@ -17,6 +32,7 @@ static std::vector<BufferAlloc> g_alloc;
 bool Context::init(const std::string& spvDir) {
     spvDir_ = spvDir;
 
+    // Instance: no validation layers, API 1.2, no extensions.
     VkApplicationInfo appInfo{};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.apiVersion = VK_API_VERSION_1_2;
@@ -45,6 +61,8 @@ bool Context::init(const std::string& spvDir) {
     std::vector<VkQueueFamilyProperties> families(familyCount);
     vkGetPhysicalDeviceQueueFamilyProperties(phys_, &familyCount, families.data());
 
+    // Pick the first queue family that supports compute (assume it also does
+    // transfer/graphics; this project only issues computes).
     bool found = false;
     for (uint32_t i = 0; i < familyCount; i++) {
         if (families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
@@ -128,6 +146,12 @@ void Context::shutdown() {
     pool_ = VK_NULL_HANDLE;
     dsPool_ = VK_NULL_HANDLE;
 }
+
+// ---------------------------------------------------------------------------
+// Buffer management: every allocation is a storage buffer backed by a
+// persistently-mapped host-visible/coherent memory object. Buffers grow on
+// demand; size is tracked so realloc frees the old GPU buffer.
+// ---------------------------------------------------------------------------
 
 VkBuffer Context::createBuffer(VkDeviceSize size) {
     VkBufferCreateInfo info{};
@@ -238,6 +262,9 @@ std::vector<char> Context::readFile(const std::string& path) {
     return data;
 }
 
+// Create a compute Pipeline from "<spvName>.spv". Every shader in this project
+// is written to accept storage buffers at bindings 0..MAX_BINDINGS-1 and up to
+// 32 bytes of push constants, so the layout is fixed and shared by all shaders.
 bool Context::loadShader(const std::string& spvName, Pipeline* out) {
     std::vector<std::string> dirs;
     dirs.push_back(spvDir_);
@@ -312,6 +339,9 @@ bool Context::loadShader(const std::string& spvName, Pipeline* out) {
     return false;
 }
 
+// Dispatch a compute shader. Pipeline is compiled once on first use and cached.
+// Each buf becomes one storage-buffer descriptor at binding = its index; the
+// push constants are copied verbatim; then a single dispatch + wait-idle runs.
 bool Context::runCompute(const std::string& spvName,
                          uint32_t workX, uint32_t workY, uint32_t workZ,
                          const std::vector<VkBuffer>& bufs,
@@ -325,6 +355,7 @@ bool Context::runCompute(const std::string& spvName,
         pipeline = it->second;
     }
 
+    // A transient descriptor set backed by the shared pool, freed right after submit.
     VkDescriptorSetAllocateInfo dsInfo{};
     dsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     dsInfo.descriptorPool = dsPool_;

@@ -1,3 +1,16 @@
+// graph.cpp — Execute a Tensor/Op graph on the Vulkan compute backend.
+//
+// runOp() is the workhorse: it maps every OpKind to a SPIR-V shader name,
+// chooses a tensor-binding order (most ops use {a,b,c,d,e,out}; some special
+// ops like QUANTIZE_FP and NORM_BWD permute the slots), computes the
+// workgroup dispatch size, and issues a single runCompute() call.
+//
+// The Tensor::dirtyUpload / dirtyDownload flags are kept in sync:
+//   uploadAll()   – pushes all tensors that were modified on the CPU
+//   forward()     – runs forward ops, marks all tensors dirtyDownload
+//   downloadAll() – pulls results back to CPU for the oracle check
+//   backward()    – same pattern, for backward ops
+
 #include "graph.h"
 #include "vulkan_api.h"
 #include <algorithm>
@@ -100,16 +113,27 @@ void Graph::downloadAll() {
     }
 }
 
+// Reinterpret a float as a raw uint32 bit pattern (for passing floats through
+// int32 push constants).
 static uint32_t f32bits(float f) {
     uint32_t u;
     std::memcpy(&u, &f, 4);
     return u;
 }
 
+// Round up a/b to the next integer (for computing workgroup dispatch counts).
 static uint32_t ceilDiv(uint32_t a, uint32_t b) {
     return (a + b - 1) / b;
 }
 
+// Dispatch a single op: resolve its shader + binding order, pick a dispatch
+// size, and call runCompute(). Returns false if the shader could not be loaded.
+//
+// Binding-order permutations (because a few shaders put operands at unusual
+// descriptor slots):
+//   default  {a,b,c,d,e,out}
+//   normBwd  {a,b,out,d,e}->{0,1,2,5,3,4}  (d = reduction temp)
+//   precFwd  {a,out,b,c,d,e}->{0,5,1,2,3,4}  (QUANTIZE_FP is in-place: a==out)
 static bool runOp(vk::Context* ctx, const Op& op) {
     Tensor* ts[6] = {op.a, op.b, op.c, op.d, op.e, op.out};
     const int* order = nullptr;
@@ -156,6 +180,8 @@ static bool runOp(vk::Context* ctx, const Op& op) {
             w1 = ceilDiv(n * cols, 64);
             break;
         case OP_MATMUL: {
+            // C[m,nn] = A[m,k] * B[k,nn].
+            // pc[3] (tA) = transpose A (A is stored k×m); pc[4] (tB) similarly.
             uint32_t tA = pc[3], tB = pc[4];
             uint32_t m = tA ? (uint32_t)op.a->cols : (uint32_t)op.a->n;
             uint32_t k = tA ? (uint32_t)op.a->n : (uint32_t)op.a->cols;
@@ -274,6 +300,9 @@ static bool runOp(vk::Context* ctx, const Op& op) {
             w1 = ceilDiv(n * cols, 256);
             break;
         case OP_QUANTIZE_FP:
+            // In-place re-quantization to fp8/fp4 at compute-graph boundaries
+            // (mirrors the CPU oracle's q()). pc[0] = element count; pc[1] = mode
+            // (1=fp8/E4M3, 2=fp4/E2M1). Operand order is {a,out,b,c,d,e}.
             pc[0] = (uint32_t)(op.a->n * op.a->cols);
             pc[1] = (uint32_t)op.pc[1];  // mode: 1=fp8, 2=fp4
             w1 = ceilDiv(pc[0], 256);
@@ -283,6 +312,9 @@ static bool runOp(vk::Context* ctx, const Op& op) {
     return ctx->runCompute(sh, w1, w2, w3, bufs, pc, 32);
 }
 
+// Replay every forward (bwd==false) op, then download all results so the CPU
+// oracle can read them. Dirty-tracking is coarse: we mark everything dirty
+// after a pass and download only what had a buffer.
 void Graph::forward() {
     uploadAll();
     for (Op& op : ops) {
@@ -296,6 +328,7 @@ void Graph::forward() {
     downloadAll();
 }
 
+// Mirrors forward() but for backward (bwd==true) ops, run in list order.
 void Graph::backward() {
     uploadAll();
     for (Op& op : ops) {
