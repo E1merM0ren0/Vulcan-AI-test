@@ -15,7 +15,7 @@
 
 - Run: `vulcan/build/vulcan_bitnet_gpt <max_train> <epochs> <seed> <base> [--fp fp32|fp8|fp4]`
   - reads `vulcan/data/<base>_train.bin` / `<base>_test.bin`
-  - exports `vulcan/data/<base>-bitnet-gpt2-<fp>.gguf`
+  - exports `vulcan/data/<base>-gpt2-<fp>.gguf` (gpt2 arch; loads under llama-server/llama-cli)
   - args are validated (non-numeric → usage + exit 2); `--help` prints usage
 - `--fp` selects compute precision (default `fp32` = unchanged). `fp8` (E4M3) / `fp4` (E2M1) re-quantize every intermediate/gradient tensor in the compute graph at the same boundaries on BOTH the CPU oracle and the GPU, so the oracle gate stays exact (`loss_diff=0, grad_diff=0`). Bitnet weight quantization (W1.58 / A8 absmax) is unchanged. Implemented in `src/precision.h` + `shaders/quantize_fp.comp` (+ `OP_QUANTIZE_FP` in `graph.cpp`).
   - Note: `quantize_fp.spv` must be present in the SPV dir at runtime; the temp/fresh build dirs (e.g. `opencode/vbuild`) are not searched by `findSPVDir()`, only `vulcan/build/spv`.
@@ -60,4 +60,7 @@ The earlier `git clone https://github.com/<repo>` attempts failed because these 
 - `git add .gitignore vulcan/train_out.txt && git commit -am "Add initial state"` → `b44c2a3`
 - `git push -u origin main` → pushed
 - `git add AGENTS.md vulcan/CMakeLists.txt vulcan/src vulcan/shaders && git commit -m "Add Vulcan GPU kernel sources, shaders, and CMake build"` → `acbf22b`, rebased onto remote `9fd7f13` → pushed as `b770f33`
+- GGUF fix + gpt2 retarget: fixed KV type tags (UINT32=4, FLOAT32=6 not 6/7), added 32-byte leading data-section alignment, added ARRAY-of-string/ARRAY-of-int32 metadata, retargeted export to `gpt2` arch with byte-level BPE tokenizer (V tokens: 256 GPT-2 byte→unicode + `cls0..`, empty merges, token_type all 1) and zero biases + fused `attn_qkv`. Verified: `mythos-gpt2-fp32|fp8|fp4.gguf` parse under gguf-py and **load under the user's llama.cpp** (`win_get ggml.llamacpp` `llama-cli` b10437) with no GGUF/tensor/shape errors.
+- `git commit -m "Add README and ignore empty root llama.cpp leftover repo"` → `f52302a`
+- `git commit -m "Fix GGUF writer (type tags, 32B data alignment), add ARRAY metadata, retarget export to gpt2 arch with byte BPE tokenizer"` → `6b36e1a`
 - Dataset pipeline plan: shallow-slice first 1000 rows → rebuild via `tools/stream_*.py` (must be rewritten) → run `vulcan_bitnet_gpt` → log exact commands here → commit + push.
