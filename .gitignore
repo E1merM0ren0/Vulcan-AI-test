@@ -1,6 +1,9 @@
 # vendored upstream llama.cpp (reference only, huge)
 vulcan/llama.cpp/
 
+# empty leftover root repo (only .git, no commits) -- never track
+llama.cpp/
+
 # build artifacts (binaries, shaders, logs)
 vulcan/build/
 
