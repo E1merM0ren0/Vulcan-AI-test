@@ -55,6 +55,7 @@ enum OpKind : int {
     OP_MSE_SQUARE,
     OP_MSE_BWD,
     OP_ROPE,
+    OP_QUANTIZE_FP,
 };
 
 struct Op {

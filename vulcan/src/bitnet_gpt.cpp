@@ -21,6 +21,7 @@
 #include "graph.h"
 #include "context.h"
 #include "gguf.h"
+#include "precision.h"
 #include "vulkan_api.h"
 
 #include <algorithm>
@@ -33,6 +34,11 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+// ---------------------------------------------------------------------------
+// precision.h brought the FP8/FP4 quantization helpers used by the CPU oracle
+// and the --fp CLI flag.
+// ---------------------------------------------------------------------------
 
 static const int E = 64;
 static const int HEADS = 4;
@@ -83,6 +89,7 @@ static float geluD(float x) {
 // ---------------------------------------------------------------------------
 
 struct CPUModel {
+    Precision prec = Precision::FP32;
     int V = 0, NCLS = 0, n = 0;
     std::vector<float> tokEmb, posEmb, finalNormW, lmHeadW;
     struct B {
@@ -147,8 +154,17 @@ struct CPUModel {
         targets.assign((size_t)n, 0);
     }
 
-    static void qAbsmax(int n_, int k, const float* X, float* Xq, float* sx) {
-        for (int r = 0; r < n_; r++) {
+    // Round a whole buffer to the selected compute precision (FP32 = identity).
+    void q(std::vector<float>& v) {
+        if (prec == Precision::FP32) return;
+        for (auto& f : v) f = quantizeTo(prec, f);
+    }
+    void q(float* v, size_t n_) {
+        if (prec == Precision::FP32) return;
+        for (size_t i = 0; i < n_; i++) v[i] = quantizeTo(prec, v[i]);
+    }
+
+    static void qAbsmax(int n_, int k, const float* X, float* Xq, float* sx) {        for (int r = 0; r < n_; r++) {
             float mx = 0.0f;
             for (int j = 0; j < k; j++) mx = std::max(mx, std::fabs(X[r * k + j]));
             float s = mx == 0.0f ? 0.0f : mx / 127.0f;
@@ -237,12 +253,15 @@ struct CPUModel {
             int t = r % SEQ;
             for (int j = 0; j < E; j++) x[r * E + j] = tokEmb[id * E + j] + posEmb[t * E + j];
         }
+        q(x);
         const float* in = x.data();
         for (int l = 0; l < BLOCKS; l++) {
             auto& r = bi[l];
             auto& B_ = b[l];
             r.xIn.assign(in, in + (size_t)n * E);
+            q(r.xIn);
             rmsFwd(n, E, in, B_.attnNormW.data(), r.a.data());
+            q(r.a);
             std::vector<float> Xq, sx;
             Xq.resize((size_t)n * E);
             sx.resize((size_t)n);
@@ -279,6 +298,7 @@ struct CPUModel {
                         r.v[rr * E + oo] = (acc * sx[rr]) * swv[oo];
                     }
             }
+            q(r.q); q(r.k); q(r.v);
             std::fill(r.attnM.begin(), r.attnM.end(), 0.0f);
             std::vector<float> s((size_t)SEQ * SEQ), o((size_t)SEQ * D);
             for (int bb = 0; bb < BATCH; bb++) {
@@ -293,6 +313,7 @@ struct CPUModel {
                             s[p * SEQ + jj] = acc;
                         }
                         for (int jj = p + 1; jj < SEQ; jj++) s[p * SEQ + jj] = -1e30f;
+                        q(s.data() + (size_t)p * SEQ, (size_t)(p + 1));  // quantize valid prefix
                         float m = -1e30f;
                         for (int jj = 0; jj < SEQ; jj++) m = std::max(m, s[p * SEQ + jj]);
                         float sum = 0.0f;
@@ -302,6 +323,7 @@ struct CPUModel {
                             sum += e;
                         }
                         for (int jj = 0; jj < SEQ; jj++) r.p[bb][hh][p * SEQ + jj] /= sum;
+                        q(r.p[bb][hh].data() + (size_t)p * SEQ, SEQ);
                         for (int dd = 0; dd < D; dd++) {
                             float acc = 0.0f;
                             for (int jj = 0; jj < SEQ; jj++) {
@@ -315,20 +337,30 @@ struct CPUModel {
                             r.attnM[(bb * SEQ + p) * E + hh * D + dd] = o[p * D + dd];
                 }
             }
+            q(r.attnM);
             std::vector<float> Xq2, Wq2, sx2, sw2;
             blFwd(n, E, E, r.attnM.data(), B_.oW.data(), r.attnOut.data(), Xq2, Wq2, sx2, sw2);
+            q(r.attnOut);
             for (int i = 0; i < n * E; i++) r.h1[i] = in[i] + r.attnOut[i];
+            q(r.h1);
             rmsFwd(n, E, r.h1.data(), B_.ffnNormW.data(), r.bn.data());
+            q(r.bn);
             blFwd(n, E, FF, r.bn.data(), B_.fUpW.data(), r.gpre.data(), Xq2, Wq2, sx2, sw2);
+            q(r.gpre);
             for (int i = 0; i < n * FF; i++) r.g[i] = geluF(r.gpre[i]);
+            q(r.g);
             blFwd(n, FF, E, r.g.data(), B_.fDnW.data(), r.ff.data(), Xq2, Wq2, sx2, sw2);
+            q(r.ff);
             for (int i = 0; i < n * E; i++) h[i] = r.h1[i] + r.ff[i];
+            q(h);
             if (l == 0) fwdH0 = h;
             in = h.data();
         }
         rmsFwd(n, E, in, finalNormW.data(), z.data());
+        q(z);
         std::vector<float> Xq, Wq, sx, sw;
         blFwd(n, E, V, z.data(), lmHeadW.data(), logits.data(), Xq, Wq, sx, sw);
+        q(logits);
     }
 
     float ceLoss() const {
@@ -381,6 +413,7 @@ struct CPUModel {
             }
         }
         this->dLogitsC = dLogits;
+        q(dLogits);
         std::vector<float> dZ((size_t)n * E, 0.0f);
         {
             std::vector<float> Xq, Wq, sx, sw;
@@ -388,10 +421,14 @@ struct CPUModel {
             blBwd(n, E, V, dLogits.data(), dZ.data(), gLmHeadW.data(), Xq, Wq, sx, sw);
             this->lmXq = Xq; this->lmWq = Wq; this->lmSx = sx; this->lmSw = sw;
         }
+        q(dZ);
+        q(gLmHeadW);
         this->dZ = dZ;
         std::vector<float> dH((size_t)n * E, 0.0f);
         rmsBwd(n, E, h.data(), finalNormW.data(), dZ.data(),
                dH.data(), gFinalNormW.data());
+        q(dH);
+        q(gFinalNormW);
 
         std::vector<float> dQ((size_t)n * E, 0.0f), dK((size_t)n * E, 0.0f), dV((size_t)n * E, 0.0f);
         for (int l = BLOCKS - 1; l >= 0; l--) {
@@ -405,6 +442,8 @@ struct CPUModel {
                 blBwd(n, FF, E, dH.data(), dG.data(), G_.fDnW.data(), Xq, Wq, sx, sw);
             }
             for (int i = 0; i < n * FF; i++) dG[i] *= geluD(r.gpre[i]);
+            q(dG);
+            q(G_.fDnW);
             this->dG = dG;
             std::vector<float> dB((size_t)n * E, 0.0f);
             {
@@ -412,13 +451,18 @@ struct CPUModel {
                 blFwd(n, E, FF, r.bn.data(), B_.fUpW.data(), r.gpre.data(), Xq, Wq, sx, sw);
                 blBwd(n, E, FF, dG.data(), dB.data(), G_.fUpW.data(), Xq, Wq, sx, sw);
             }
+            q(dB);
+            q(G_.fUpW);
             this->dB = dB;
             std::vector<float> dH1b((size_t)n * E, 0.0f);
             rmsBwd(n, E, r.h1.data(), B_.ffnNormW.data(), dB.data(),
                    dH1b.data(), G_.ffnNormW.data());
+            q(dH1b);
+            q(G_.ffnNormW);
             this->dH1b = dH1b;
             std::vector<float> dXres((size_t)n * E, 0.0f);
             for (int i = 0; i < n * E; i++) dXres[i] = dH[i] + dH1b[i];
+            q(dXres);
             this->dXres = dXres;
             std::vector<float> dAttnM((size_t)n * E, 0.0f);
             {
@@ -426,6 +470,8 @@ struct CPUModel {
                 blFwd(n, E, E, r.attnM.data(), B_.oW.data(), r.attnOut.data(), Xq, Wq, sx, sw);
                 blBwd(n, E, E, dXres.data(), dAttnM.data(), G_.oW.data(), Xq, Wq, sx, sw);
             }
+            q(dAttnM);
+            q(G_.oW);
             this->dAttnM = dAttnM;
             for (int bb = 0; bb < BATCH; bb++) {
                 for (int hh = 0; hh < HEADS; hh++) {
@@ -508,6 +554,7 @@ struct GPUModel {
     Graph g;
 
     int V = 0, NCLS = 0, n = 0, SEP_ID = 0;
+    Precision prec = Precision::FP32;
 
     Tensor *ids = nullptr, *targets = nullptr, *mask = nullptr, *ones = nullptr;
     Tensor *lossPartial = nullptr, *loss = nullptr;
@@ -718,26 +765,39 @@ struct GPUModel {
         addOp(OP_SCALE_ROWS, M2, sx, ones, nullptr, nullptr, dXacc, {0, 0, (int32_t)acc}, true);
     }
 
+    // Insert an fp8/fp4 quantization pass on tensor t (in place) at the same
+    // boundaries where the CPU oracle calls q(). No-op under FP32.
+    void precQ(Tensor* t, bool bwd) {
+        if (prec == Precision::FP32) return;
+        int mode = (prec == Precision::FP8) ? 1 : 2;
+        addOp(OP_QUANTIZE_FP, t, nullptr, nullptr, nullptr, nullptr, t, {0, mode, 0, 0}, bwd);
+    }
+
     void build() {
         // ---- forward ----
         addOp(OP_EMBEDDING, ids, tokEmbW, nullptr, nullptr, nullptr, x0, {0, 0}, false);
         addOp(OP_ADD_POS, x0, posEmbW, nullptr, nullptr, nullptr, x0, {0, 0, SEQ}, false);
+        precQ(x0, false);
 
         for (int l = 0; l < BLOCKS; l++) {
             auto& b = blk[l];
             Tensor* in = (l == 0) ? x0 : blk[l - 1].h;
             addOp(OP_RMS_NORM, in, b.attnNormW, nullptr, nullptr, nullptr, b.a,
                   {0, 0, f32bits_i(LN_EPS)}, false);
+            precQ(b.a, false);
             addOp(OP_QUANTIZE_ABSMAX, b.a, b.Xq, b.sx, nullptr, nullptr, nullptr, {0, 0}, false);
             addOp(OP_QUANTIZE_TERNARY, b.qW, b.wqQ, b.swQ, nullptr, nullptr, nullptr, {0, 0}, false);
             addOp(OP_MATMUL, b.Xq, b.wqQ, nullptr, nullptr, nullptr, b.q, {0, 0, 0, 0, 1}, false);
             addOp(OP_SCALE_ROWS, b.q, b.sx, b.swQ, nullptr, nullptr, b.q, {0, 0, 0}, false);
+            precQ(b.q, false);
             addOp(OP_QUANTIZE_TERNARY, b.kW, b.wqK, b.swK, nullptr, nullptr, nullptr, {0, 0}, false);
             addOp(OP_MATMUL, b.Xq, b.wqK, nullptr, nullptr, nullptr, b.k, {0, 0, 0, 0, 1}, false);
             addOp(OP_SCALE_ROWS, b.k, b.sx, b.swK, nullptr, nullptr, b.k, {0, 0, 0}, false);
+            precQ(b.k, false);
             addOp(OP_QUANTIZE_TERNARY, b.vW, b.wqV, b.swV, nullptr, nullptr, nullptr, {0, 0}, false);
             addOp(OP_MATMUL, b.Xq, b.wqV, nullptr, nullptr, nullptr, b.v, {0, 0, 0, 0, 1}, false);
             addOp(OP_SCALE_ROWS, b.v, b.sx, b.swV, nullptr, nullptr, b.v, {0, 0, 0}, false);
+            precQ(b.v, false);
 
             addOp(OP_ZERO, nullptr, nullptr, nullptr, nullptr, nullptr, b.attnM, {0, 0}, false);
             for (int bb = 0; bb < BATCH; bb++) {
@@ -749,46 +809,72 @@ struct GPUModel {
                     addOp(OP_MATMUL, b.qh[bb][hh], b.kh[bb][hh], nullptr, nullptr, nullptr, sS,
                           {0, 0, 0, 0, 1}, false);
                     addOp(OP_ADD, sS, mask, nullptr, nullptr, nullptr, smS, {0, 0}, false);
+                    precQ(smS, false);
                     addOp(OP_SOFTMAX, smS, nullptr, nullptr, nullptr, nullptr, b.p[bb][hh], {0, 0}, false);
+                    precQ(b.p[bb][hh], false);
                     addOp(OP_MATMUL, b.p[bb][hh], b.vh[bb][hh], nullptr, nullptr, nullptr, oS,
                           {0, 0, 0, 0, 0}, false);
                     addOp(OP_MERGE_HEADS, oS, nullptr, nullptr, nullptr, nullptr, b.attnM, sp, false);
                 }
             }
+            precQ(b.attnM, false);
             addBlFwd(b.attnM, b.oW, b.Xqo, b.sxo, b.wqO, b.swO, b.attnOut);
+            precQ(b.attnOut, false);
             addOp(OP_ADD, in, b.attnOut, nullptr, nullptr, nullptr, b.h1, {0, 0}, false);
+            precQ(b.h1, false);
             addOp(OP_RMS_NORM, b.h1, b.ffnNormW, nullptr, nullptr, nullptr, b.bn,
                   {0, 0, f32bits_i(LN_EPS)}, false);
+            precQ(b.bn, false);
             addBlFwd(b.bn, b.fUpW, b.Xqfu, b.sxfu, b.wqFU, b.swFU, b.gpre);
+            precQ(b.gpre, false);
             addOp(OP_GELU, b.gpre, nullptr, nullptr, nullptr, nullptr, b.g, {0, 0}, false);
+            precQ(b.g, false);
             addBlFwd(b.g, b.fDnW, b.Xqfd, b.sxfd, b.wqFD, b.swFD, b.ff);
+            precQ(b.ff, false);
             addOp(OP_ADD, b.h1, b.ff, nullptr, nullptr, nullptr, b.h, {0, 0}, false);
+            precQ(b.h, false);
         }
         addOp(OP_RMS_NORM, blk[BLOCKS - 1].h, finalNormW, nullptr, nullptr, nullptr, z,
               {0, 0, f32bits_i(LN_EPS)}, false);
+        precQ(z, false);
         addBlFwd(z, lmHeadW, zq, sz, wqLM, swLM, logits);
+        precQ(logits, false);
         addOp(OP_CROSS_ENTROPY, logits, targets, nullptr, nullptr, nullptr, lossPartial, {0, 0}, false);
         addOp(OP_REDUCE_SUM_ROWS, lossPartial, nullptr, nullptr, nullptr, nullptr, loss, {0, 0}, false);
 
         // ---- backward ----
         addOp(OP_CROSS_ENTROPY_BWD, logits, targets, nullptr, nullptr, nullptr, dLogits,
               {0, 0}, true);
+        precQ(dLogits, true);
         addBlBwd(dLogits, wqLM, swLM, zq, sz, ones, M1lm, M2lm, dLmHeadW, dZ, 0);
+        precQ(dLmHeadW, true);
+        precQ(dZ, true);
         addOp(OP_RMS_NORM_BWD, blk[BLOCKS - 1].h, finalNormW, dZ, dwP, nullptr, dHcur,
               {0, 0, f32bits_i(LN_EPS)}, true);
         addOp(OP_REDUCE_SUM_ROWS, dwP, nullptr, nullptr, nullptr, nullptr, dFinalNormW, {0, 0}, true);
+        precQ(dFinalNormW, true);
+        precQ(dHcur, true);
 
         for (int l = BLOCKS - 1; l >= 0; l--) {
             auto& b = blk[l];
             Tensor* in = (l == 0) ? x0 : blk[l - 1].h;
             addBlBwd(dHcur, b.wqFD, b.swFD, b.Xqfd, b.sxfd, ones, b.M1fD, b.M2fD, b.dFdW, dG, 0);
+            precQ(b.dFdW, true);
             addOp(OP_GELU_BWD, b.gpre, dG, nullptr, nullptr, nullptr, dG, {0, 0}, true);
+            precQ(dG, true);
             addBlBwd(dG, b.wqFU, b.swFU, b.Xqfu, b.sxfu, ones, b.M1fU, b.M2fU, b.dFuW, dB, 0);
+            precQ(b.dFuW, true);
+            precQ(dB, true);
             addOp(OP_RMS_NORM_BWD, b.h1, b.ffnNormW, dB, dwP, nullptr, dH1b,
                   {0, 0, f32bits_i(LN_EPS)}, true);
             addOp(OP_REDUCE_SUM_ROWS, dwP, nullptr, nullptr, nullptr, nullptr, b.dFfnNormW, {0, 0}, true);
+            precQ(b.dFfnNormW, true);
+            precQ(dH1b, true);
             addOp(OP_ADD, dHcur, dH1b, nullptr, nullptr, nullptr, dXres, {0, 0}, true);
+            precQ(dXres, true);
             addBlBwd(dXres, b.wqO, b.swO, b.Xqo, b.sxo, ones, b.M1oW, b.M2oW, b.dOW, dAttnM, 0);
+            precQ(b.dOW, true);
+            precQ(dAttnM, true);
 
             addOp(OP_ZERO, nullptr, nullptr, nullptr, nullptr, nullptr, dQ, {0, 0}, true);
             addOp(OP_ZERO, nullptr, nullptr, nullptr, nullptr, nullptr, dK, {0, 0}, true);
@@ -811,13 +897,23 @@ struct GPUModel {
                     addOp(OP_MERGE_HEADS, dVhS, nullptr, nullptr, nullptr, nullptr, dV, sp, true);
                 }
             }
+            precQ(dQ, true);
+            precQ(dK, true);
+            precQ(dV, true);
             addBlBwd(dQ, b.wqQ, b.swQ, b.Xq, b.sx, ones, b.M1q, b.M2q, b.dQW, dN1, 0);
             addBlBwd(dK, b.wqK, b.swK, b.Xq, b.sx, ones, b.M1k, b.M2k, b.dKW, dN1, 1);
             addBlBwd(dV, b.wqV, b.swV, b.Xq, b.sx, ones, b.M1v, b.M2v, b.dVW, dN1, 1);
+            precQ(b.dQW, true);
+            precQ(b.dKW, true);
+            precQ(b.dVW, true);
+            precQ(dN1, true);
             addOp(OP_RMS_NORM_BWD, in, b.attnNormW, dN1, dwP, nullptr, dXa,
                   {0, 0, f32bits_i(LN_EPS)}, true);
             addOp(OP_REDUCE_SUM_ROWS, dwP, nullptr, nullptr, nullptr, nullptr, b.dAttnNormW, {0, 0}, true);
+            precQ(b.dAttnNormW, true);
+            precQ(dXa, true);
             addOp(OP_ADD, dXres, dXa, nullptr, nullptr, nullptr, dXout, {0, 0}, true);
+            precQ(dXout, true);
             dHcur = dXout;
         }
         addOp(OP_ADD_POS_BWD, dHcur, dXout, dPosEmbW, nullptr, nullptr, nullptr,
@@ -1102,23 +1198,41 @@ static bool parsePosInt(const char* s, int& out) {
 
 static void usage(const char* prog) {
     std::cerr
-        << "usage: " << prog << " [<trainUse> <epochs> <seed> <base>] [--help]\n"
+        << "usage: " << prog << " [<trainUse> <epochs> <seed> <base>] [--fp fp32|fp8|fp4] [--help]\n"
         << "  trainUse  max train rows to use (default 6000)\n"
         << "  epochs    number of epochs (default 5)\n"
         << "  seed      RNG seed (default 42)\n"
         << "  base      dataset base name; reads vulcan/data/<base>_train.bin / _test.bin\n"
         << "            defaults to \"mnist\"\n"
+        << "  --fp <v>  compute precision: fp32, fp8 (E4M3), or fp4 (E2M1)\n"
+        << "            (default fp32; bitnet weight quantization is unchanged)\n"
         << "  --help    show this message and exit\n";
+}
+
+static bool parsePrecision(const char* s, Precision& out) {
+    if (std::string(s) == "fp32") { out = Precision::FP32; return true; }
+    if (std::string(s) == "fp8")  { out = Precision::FP8;  return true; }
+    if (std::string(s) == "fp4")  { out = Precision::FP4;  return true; }
+    return false;
 }
 
 int main(int argc, char** argv) {
     int trainUse = 6000, epochs = 5, seed = 42;
     std::string base = "mnist";
+    Precision prec = Precision::FP32;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--help" || a == "-h") {
             usage(argv[0]);
             return 0;
+        }
+        if (a == "--fp") {
+            if (i + 1 >= argc || !parsePrecision(argv[i + 1], prec)) {
+                usage(argv[0]);
+                return 2;
+            }
+            i++;
+            continue;
         }
     }
     if (argc > 1 && !parsePosInt(argv[1], trainUse)) {
@@ -1162,18 +1276,21 @@ int main(int argc, char** argv) {
     int V = 256 + NCLS + 1;
 
     std::cout << "vulcan_bitnet_gpt base=" << base << " trainUse=" << trainUse
-              << " epochs=" << epochs << " NCLS=" << NCLS << " V=" << V << "\n";
+              << " epochs=" << epochs << " NCLS=" << NCLS << " V=" << V
+              << " fp=" << precisionName(prec) << "\n";
     std::cout.flush();
 
     std::mt19937 rng(seed);
     CPUModel cpu;
     cpu.initRandom(NCLS, rng);
+    cpu.prec = prec;
 
     GPUModel m;
     m.NCLS = NCLS;
     m.V = V;
     m.n = BATCH * SEQ;
     m.SEP_ID = SEP;
+    m.prec = prec;
     m.g.ctx = &m.ctx;
     if (!m.ctx.init(findSPVDir())) {
         std::cerr << "vulkan init failed\n";
@@ -1202,7 +1319,7 @@ int main(int argc, char** argv) {
 
     float acc = m.eval(eX, eY, eF, eN);
     std::cout << "test_accuracy=" << acc * 100.0f << "%\n";
-    m.exportGGUF("vulcan/data/" + base + "-bitnet-gpt2-f32.gguf");
+    m.exportGGUF("vulcan/data/" + base + "-bitnet-gpt2-" + precisionName(prec) + ".gguf");
     m.ctx.shutdown();
     return 0;
 }

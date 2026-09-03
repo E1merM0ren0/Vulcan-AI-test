@@ -13,10 +13,12 @@
 
 ## Training
 
-- Run: `vulcan/build/vulcan_bitnet_gpt <max_train> <epochs> <seed> <base>`
+- Run: `vulcan/build/vulcan_bitnet_gpt <max_train> <epochs> <seed> <base> [--fp fp32|fp8|fp4]`
   - reads `vulcan/data/<base>_train.bin` / `<base>_test.bin`
-  - exports `vulcan/data/<base>-bitnet-gpt2-f32.gguf`
+  - exports `vulcan/data/<base>-bitnet-gpt2-<fp>.gguf`
   - args are validated (non-numeric → usage + exit 2); `--help` prints usage
+- `--fp` selects compute precision (default `fp32` = unchanged). `fp8` (E4M3) / `fp4` (E2M1) re-quantize every intermediate/gradient tensor in the compute graph at the same boundaries on BOTH the CPU oracle and the GPU, so the oracle gate stays exact (`loss_diff=0, grad_diff=0`). Bitnet weight quantization (W1.58 / A8 absmax) is unchanged. Implemented in `src/precision.h` + `shaders/quantize_fp.comp` (+ `OP_QUANTIZE_FP` in `graph.cpp`).
+  - Note: `quantize_fp.spv` must be present in the SPV dir at runtime; the temp/fresh build dirs (e.g. `opencode/vbuild`) are not searched by `findSPVDir()`, only `vulcan/build/spv`.
 - Known dataset bases (in `vulcan/data/` + build logs): `mythos`, `sumtables`, `fable5`, `code`, `mnist`.
 - Harness runs a GPU-vs-CPU oracle check (`ORACLE: PASS`) before training; past runs are logged in `vulcan/build/*.log`.
 - `.bin` format (see `context.cpp` `loadBin`): `uint32 n, uint32 feat(=784)`, then n×784 float32 bytes (each 0..255), then n float32 labels (class id). Rows are the UTF-8 bytes of text, right-padded with 0.

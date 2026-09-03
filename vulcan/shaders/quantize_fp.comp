@@ -1,0 +1,64 @@
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0, std430) readonly buffer B0 { float X[]; };
+layout(binding = 1, std430) buffer B1 { float Y[]; };
+layout(push_constant) uniform PC { uint n; uint mode; uint pad2; uint pad3; uint pad4; uint pad5; uint pad6; uint pad7; } pc;
+
+// fp8 e4m3: 1 sign, 4 exp, 3 mantissa. Port of precision.h fp8E4M3Encode/Decode.
+// Round-to-nearest-even on the dropped mantissa bits.
+float fp8e4m3(float x) {
+    uint uu = floatBitsToUint(x);
+    uint sign = (uu >> 31u) & 1u;
+    int e = int((uu >> 23u) & 0xffu) - 127;
+    uint mant = uu & 0x7fffffu;
+
+    if ((uu & 0x7fffffffu) == 0u) return sign != 0u ? -0.0f : 0.0f;
+    if (e > 8) {
+        // overflow -> clamp to max finite ~448 (sign | 0x7E)
+        uint b = (sign << 7u) | 0x7Eu;
+        // direct reconstruction: value = (1 + mantissa/8)*2^(exp-7) for exp=15,m=6 = 448
+        return (sign != 0u ? -448.0f : 448.0f);
+    }
+    if (e < -6) {
+        // subnormal / zero
+        if (e < -8) return sign != 0u ? -0.0f : 0.0f;
+        // subnormal: value = m2 * 2^-9
+        uint m2 = (1u | (mant >> 20u)) >> uint(8 - (e + 6));
+        return (sign != 0u ? -1.0f : 1.0f) * float(m2) * 0.001953125f;
+    }
+    uint m2 = mant >> 20u;           // top 3 mantissa bits
+    uint rem = mant & 0xfffffu;      // dropped bits
+    if (rem > 0x80000u || (rem == 0x80000u && (m2 & 1u) != 0u)) m2++;
+    uint biased = uint(e + 7);
+    if (m2 > 7u) { m2 = 0u; biased++; }
+    // decode: (1 + m2/8) * 2^(biased-7)
+    float mm = float(8u + m2);
+    float pow2 = exp2(float(int(biased) - 7 - 3));
+    float val = mm * pow2;
+    return sign != 0u ? -val : val;
+}
+
+// fp4 e2m1 standard grid: 0, 0.5, 1, 1.5, 2, 3, 4, 6 (nearest)
+float fp4e2m1(float x) {
+    float a = abs(x);
+    uint sign = (floatBitsToUint(x) >> 31u) & 1u;
+    float v;
+    if (a < 0.25f)      v = 0.0f;
+    else if (a < 0.75f) v = 0.5f;
+    else if (a < 1.25f) v = 1.0f;
+    else if (a < 1.75f) v = 1.5f;
+    else if (a < 2.5f)  v = 2.0f;
+    else if (a < 3.5f)  v = 3.0f;
+    else if (a < 5.0f)  v = 4.0f;
+    else                v = 6.0f;
+    return sign != 0u ? -v : v;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    float v = X[i];
+    if (pc.mode == 1u) v = fp8e4m3(v);
+    else if (pc.mode == 2u) v = fp4e2m1(v);
+    Y[i] = v;
+}

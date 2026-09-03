@@ -49,6 +49,7 @@ static const char* shaderFor(OpKind kind) {
         case OP_MSE_SQUARE: return "mse_square";
         case OP_MSE_BWD: return "mse_bwd";
         case OP_ROPE: return "rope";
+        case OP_QUANTIZE_FP: return "quantize_fp";
     }
     return "zero";
 }
@@ -114,7 +115,9 @@ static bool runOp(vk::Context* ctx, const Op& op) {
     const int* order = nullptr;
     static const int def[6] = {0, 1, 2, 3, 4, 5};
     static const int normBwd[6] = {0, 1, 2, 5, 3, 4};  // a, b, c, out, d, e
+    static const int precFwd[6] = {0, 5, 1, 2, 3, 4};  // a, out, b, c, d, e
     if (op.kind == OP_RMS_NORM_BWD || op.kind == OP_LAYER_NORM_BWD) order = normBwd;
+    else if (op.kind == OP_QUANTIZE_FP) order = precFwd;
     else order = def;
     std::vector<VkBuffer> bufs;
     for (int i = 0; i < 6; i++) {
@@ -269,6 +272,11 @@ static bool runOp(vk::Context* ctx, const Op& op) {
             n = (uint32_t)op.a->n; cols = (uint32_t)op.a->cols;
             pc[0] = n; pc[1] = cols;
             w1 = ceilDiv(n * cols, 256);
+            break;
+        case OP_QUANTIZE_FP:
+            pc[0] = (uint32_t)(op.a->n * op.a->cols);
+            pc[1] = (uint32_t)op.pc[1];  // mode: 1=fp8, 2=fp4
+            w1 = ceilDiv(pc[0], 256);
             break;
     }
 
