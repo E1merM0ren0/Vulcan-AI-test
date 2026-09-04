@@ -134,7 +134,7 @@ static uint32_t ceilDiv(uint32_t a, uint32_t b) {
 //   default  {a,b,c,d,e,out}
 //   normBwd  {a,b,out,d,e}->{0,1,2,5,3,4}  (d = reduction temp)
 //   precFwd  {a,out,b,c,d,e}->{0,5,1,2,3,4}  (QUANTIZE_FP is in-place: a==out)
-static bool runOp(vk::Context* ctx, const Op& op) {
+static bool runOp(vk::Context* ctx, const Op& op, bool deferred, bool barrierAfter = true) {
     Tensor* ts[6] = {op.a, op.b, op.c, op.d, op.e, op.out};
     const int* order = nullptr;
     static const int def[6] = {0, 1, 2, 3, 4, 5};
@@ -309,35 +309,39 @@ static bool runOp(vk::Context* ctx, const Op& op) {
             break;
     }
 
-    return ctx->runCompute(sh, w1, w2, w3, bufs, pc, 32);
+    return ctx->runCompute(sh, w1, w2, w3, bufs, pc, 32, deferred, true);
 }
 
 // Replay every forward (bwd==false) op, then download all results so the CPU
-// oracle can read them. Dirty-tracking is coarse: we mark everything dirty
-// after a pass and download only what had a buffer.
-void Graph::forward() {
-    uploadAll();
-    for (Op& op : ops) {
-        if (op.bwd) continue;
-        if (!runOp(ctx, op)) {
-            std::cerr << "op failed (forward)\n";
-            break;
-        }
-    }
-    for (Tensor* t : tensors) t->dirtyDownload = true;
-    downloadAll();
-}
+ // oracle can read them. Dirty-tracking is coarse: we mark everything dirty
+ // after a pass and download only what had a buffer.
+ void Graph::forward() {
+     uploadAll();
+     ctx->beginDeferredBatch();
+     for (Op& op : ops) {
+         if (op.bwd) continue;
+         if (!runOp(ctx, op, true)) {
+             std::cerr << "op failed (forward)\n";
+             break;
+         }
+     }
+     ctx->submitAndWait();
+     for (Tensor* t : tensors) t->dirtyDownload = true;
+     downloadAll();
+ }
 
-// Mirrors forward() but for backward (bwd==true) ops, run in list order.
-void Graph::backward() {
-    uploadAll();
-    for (Op& op : ops) {
-        if (!op.bwd) continue;
-        if (!runOp(ctx, op)) {
-            std::cerr << "op failed (backward)\n";
-            break;
-        }
-    }
-    for (Tensor* t : tensors) t->dirtyDownload = true;
-    downloadAll();
-}
+ // Mirrors forward() but for backward (bwd==true) ops, run in list order.
+ void Graph::backward() {
+     uploadAll();
+     ctx->beginDeferredBatch();
+     for (Op& op : ops) {
+         if (!op.bwd) continue;
+         if (!runOp(ctx, op, true)) {
+             std::cerr << "op failed (backward)\n";
+             break;
+         }
+     }
+     ctx->submitAndWait();
+     for (Tensor* t : tensors) t->dirtyDownload = true;
+     downloadAll();
+ }

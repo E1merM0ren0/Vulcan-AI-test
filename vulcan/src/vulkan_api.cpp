@@ -111,12 +111,12 @@ bool Context::init(const std::string& spvDir) {
 
     VkDescriptorPoolSize poolSize{};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = 128;
+    poolSize.descriptorCount = 8192;
 
     VkDescriptorPoolCreateInfo dpInfo{};
     dpInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dpInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    dpInfo.maxSets = 64;
+    dpInfo.maxSets = 4096;
     dpInfo.poolSizeCount = 1;
     dpInfo.pPoolSizes = &poolSize;
     vkCreateDescriptorPool(device_, &dpInfo, nullptr, &dsPool_);
@@ -340,76 +340,135 @@ bool Context::loadShader(const std::string& spvName, Pipeline* out) {
 }
 
 // Dispatch a compute shader. Pipeline is compiled once on first use and cached.
-// Each buf becomes one storage-buffer descriptor at binding = its index; the
-// push constants are copied verbatim; then a single dispatch + wait-idle runs.
-bool Context::runCompute(const std::string& spvName,
-                         uint32_t workX, uint32_t workY, uint32_t workZ,
-                         const std::vector<VkBuffer>& bufs,
-                         const void* pc, uint32_t pcSize) {
-    Pipeline pipeline;
-    auto it = pipelines_.find(spvName);
-    if (it == pipelines_.end()) {
-        if (!loadShader(spvName, &pipeline)) return false;
-        pipelines_[spvName] = pipeline;
-    } else {
-        pipeline = it->second;
+    // Each buf becomes one storage-buffer descriptor at binding = its index; the
+    // push constants are copied verbatim; then a single dispatch + wait-idle runs.
+    // If `deferred` is true, records into the active command buffer without submitting;
+    // caller must call submitAndWait() after all deferred dispatches.
+    bool Context::runCompute(const std::string& spvName,
+                          uint32_t workX, uint32_t workY, uint32_t workZ,
+                          const std::vector<VkBuffer>& bufs,
+                          const void* pc, uint32_t pcSize,
+                          bool deferred,
+                          bool barrierAfter) {
+        Pipeline pipeline;
+        auto it = pipelines_.find(spvName);
+        if (it == pipelines_.end()) {
+            if (!loadShader(spvName, &pipeline)) return false;
+            pipelines_[spvName] = pipeline;
+        } else {
+            pipeline = it->second;
+        }
+
+        // A transient descriptor set backed by the shared pool.
+        VkDescriptorSetAllocateInfo dsInfo{};
+        dsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsInfo.descriptorPool = dsPool_;
+        dsInfo.descriptorSetCount = 1;
+        dsInfo.pSetLayouts = &pipeline.dsLayout;
+
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        if (vkAllocateDescriptorSets(device_, &dsInfo, &set) != VK_SUCCESS) {
+            std::cerr << "vkAllocateDescriptorSets failed\n";
+            return false;
+        }
+
+        std::vector<VkDescriptorBufferInfo> bufferInfos(bufs.size());
+        std::vector<VkWriteDescriptorSet> writes(bufs.size());
+        for (size_t i = 0; i < bufs.size(); i++) {
+            bufferInfos[i].buffer = bufs[i];
+            bufferInfos[i].offset = 0;
+            bufferInfos[i].range = VK_WHOLE_SIZE;
+
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = set;
+            writes[i].dstBinding = (uint32_t)i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &bufferInfos[i];
+        }
+        vkUpdateDescriptorSets(device_, (uint32_t)writes.size(), writes.data(), 0, nullptr);
+
+        if (!deferred) {
+            vkResetCommandBuffer(cmd_, 0);
+
+            VkCommandBufferBeginInfo begin{};
+            begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkBeginCommandBuffer(cmd_, &begin);
+        } else {
+            deferredDescriptorSets_.push_back(set);
+        }
+
+        vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
+        vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, &set, 0, nullptr);
+        if (pcSize > 0) {
+            vkCmdPushConstants(cmd_, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pcSize, pc);
+        }
+        vkCmdDispatch(cmd_, workX, workY, workZ);
+
+        if (barrierAfter && deferred) {
+            VkBufferMemoryBarrier barrier{};
+            barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            // Apply to all buffers used in this dispatch
+            for (VkBuffer buf : bufs) {
+                barrier.buffer = buf;
+                barrier.offset = 0;
+                barrier.size = VK_WHOLE_SIZE;
+                vkCmdPipelineBarrier(cmd_,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0, 0, nullptr, 1, &barrier, 0, nullptr);
+            }
+        }
+
+        if (!deferred) {
+            vkEndCommandBuffer(cmd_);
+
+            VkSubmitInfo submit{};
+            submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submit.commandBufferCount = 1;
+            submit.pCommandBuffers = &cmd_;
+
+            vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE);
+            vkQueueWaitIdle(queue_);
+            vkFreeDescriptorSets(device_, dsPool_, 1, &set);
+        }
+
+        return true;
     }
 
-    // A transient descriptor set backed by the shared pool, freed right after submit.
-    VkDescriptorSetAllocateInfo dsInfo{};
-    dsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dsInfo.descriptorPool = dsPool_;
-    dsInfo.descriptorSetCount = 1;
-    dsInfo.pSetLayouts = &pipeline.dsLayout;
-
-    VkDescriptorSet set = VK_NULL_HANDLE;
-    if (vkAllocateDescriptorSets(device_, &dsInfo, &set) != VK_SUCCESS) {
-        std::cerr << "vkAllocateDescriptorSets failed\n";
-        return false;
+    void Context::beginDeferredBatch() {
+        deferredDescriptorSets_.clear();
+        vkResetCommandBuffer(cmd_, 0);
+        VkCommandBufferBeginInfo begin{};
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd_, &begin);
     }
 
-    std::vector<VkDescriptorBufferInfo> bufferInfos(bufs.size());
-    std::vector<VkWriteDescriptorSet> writes(bufs.size());
-    for (size_t i = 0; i < bufs.size(); i++) {
-        bufferInfos[i].buffer = bufs[i];
-        bufferInfos[i].offset = 0;
-        bufferInfos[i].range = VK_WHOLE_SIZE;
+    bool Context::submitAndWait() {
+        vkEndCommandBuffer(cmd_);
 
-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = set;
-        writes[i].dstBinding = (uint32_t)i;
-        writes[i].descriptorCount = 1;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[i].pBufferInfo = &bufferInfos[i];
+        VkSubmitInfo submit{};
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &cmd_;
+
+        VkResult res = vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE);
+        if (res != VK_SUCCESS) {
+            std::cerr << "vkQueueSubmit failed: " << res << "\n";
+            return false;
+        }
+        vkQueueWaitIdle(queue_);
+        if (!deferredDescriptorSets_.empty()) {
+            vkFreeDescriptorSets(device_, dsPool_, (uint32_t)deferredDescriptorSets_.size(), deferredDescriptorSets_.data());
+            deferredDescriptorSets_.clear();
+        }
+        return true;
     }
-    vkUpdateDescriptorSets(device_, (uint32_t)writes.size(), writes.data(), 0, nullptr);
-
-    vkResetCommandBuffer(cmd_, 0);
-
-    VkCommandBufferBeginInfo begin{};
-    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd_, &begin);
-
-    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
-    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0, 1, &set, 0, nullptr);
-    if (pcSize > 0) {
-        vkCmdPushConstants(cmd_, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pcSize, pc);
-    }
-    vkCmdDispatch(cmd_, workX, workY, workZ);
-
-    vkEndCommandBuffer(cmd_);
-
-    VkSubmitInfo submit{};
-    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &cmd_;
-
-    vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue_);
-    vkFreeDescriptorSets(device_, dsPool_, 1, &set);
-
-    return true;
-}
 
 }

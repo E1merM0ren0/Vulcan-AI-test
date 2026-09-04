@@ -48,13 +48,21 @@ public:
     // memset the persistent mapping to zero.
     void zeroBuffer(VkBuffer b, VkDeviceSize size);
 
-    // Dispatch one compute shader named spvName over workX*workY*workZ groups.
-    // `bufs` are bound to descriptor bindings 0..bufs.size()-1; `pc`/`pcSize`
-    // (<=32 bytes) become the shader's push constants. Caches pipelines by name.
+    // Dispatch one compute shader. If `deferred` is true, records into the active
+    // command buffer without submitting; caller must call submitAndWait() after
+    // all deferred dispatches. If `deferred` is false (default), submits and
+    // waits immediately (legacy behavior).
     bool runCompute(const std::string& spvName,
                     uint32_t workX, uint32_t workY, uint32_t workZ,
                     const std::vector<VkBuffer>& bufs,
-                    const void* pc, uint32_t pcSize);
+                    const void* pc, uint32_t pcSize,
+                    bool deferred = false,
+                    bool barrierAfter = false);
+    // Submit the currently recorded command buffer and wait for GPU idle.
+    // Only valid after one or more deferred runCompute() calls.
+    bool submitAndWait();
+    // Begin a new deferred batch (resets command buffer).
+    void beginDeferredBatch();
 
     // Compile spvName.spv into a Pipeline (used internally by runCompute).
     bool loadShader(const std::string& spvName, Pipeline* out);
@@ -81,6 +89,8 @@ private:
     std::string spvDir_;
     // name -> compiled pipeline cache.
     std::map<std::string, Pipeline> pipelines_;
+    // Descriptor sets allocated during deferred batch, freed in submitAndWait().
+    std::vector<VkDescriptorSet> deferredDescriptorSets_;
 };
 
 }
